@@ -35,6 +35,6 @@ It was made just to learn more about mining.
 This repo contains a couple weeks worth of vibe coding. I'm pretty tech savvy but I don't know any programming languages. 
 All the code here was vibe coded. Although I think to be a vibe coder you probably need to at least know some code. 
 I will begin learning how to code to better understand these scripts I generated. I like the act of creating itself. 
-There is something very satisfying about iterating a script for a long time. To see it come together at least somewht. 
+There is something very satisfying about iterating a script for a long time. To see it come together at least somewhat. 
 
 
