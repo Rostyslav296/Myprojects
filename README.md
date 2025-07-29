@@ -2,7 +2,7 @@ On this Repo there are a number of Python scripts, here is a summary of them:
 
 **Piranha.py** is a python script for launching local LLMs: deepseek r1-7b, Qwen 3, and gemini 1.5pro.
 The purpose of the script is to give local LLM models agentic properties. This script is not fully functional as the models tend to hallucinate or behave in a clunky way. It is a work in progress. 
-The cool thing about this script is the organiation of multiple LLM "agents" in one framework with a dedicated tools section in the script to develop. 
+The cool thing about this script is the organization of multiple LLM "agents" in one framework with a dedicated tools section in the script to develop. 
 I ran into the issue of iterations constantly breaking the program or the boot structure, so I have clearly demarcated the boot related code, so you can edit the parts that need iteration, but leave the main boot structure in tact. 
 
 
