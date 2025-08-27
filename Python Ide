@@ -1,0 +1,2311 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MiniNano — nano-like IDE (Tkinter)
+Features:
+- View → Dark Mode toggle
+- View → Chat Panel toggle (scratchpad on the right; Ctrl+Enter sends selection/line to Run)
+- Line numbers gutter (kept in sync with scroll)
+- Undo/Redo buttons (+ Ctrl+Z / Ctrl+Y)
+- Copy All (+ Ctrl+Shift+C)
+- Auto-Save toggle + interval (drafts at ~/.config/mininano/autosaves/ if unsaved)
+- Resizable panes via splitters (editor↔chat horizontally, consoles below vertically)
+- Run Console (interactive: Send, SIGINT, EOF)
+- GPT-5 CLI Console (second tab) with editable command
+- NEW: Restart button & File → Restart menu to reboot the IDE (self-reload)
+- NEW: “New Console Tab” button — spawns independent shell consoles
+- NEW: GCC tab — compiles C source to Executable, .o, .s, .i with flags/output dir
+
+Linux deps: Python 3 + Tk
+"""
+
+import os, sys, threading, subprocess, signal, time, json, shlex
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+APP_TITLE = "MiniNano"
+MONO_FONT = ("DejaVu Sans Mono", 11)
+
+# ---------- Config ----------
+CFG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mininano"
+AUTOSAVE_DIR = CFG_DIR / "autosaves"
+for p in (CFG_DIR, AUTOSAVE_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+DEFAULTS = {
+    "dark_mode": True,
+    "autosave": False,
+    "autosave_interval_sec": 10,
+    # Safe demo default (echoes input). Replace in UI with: `ollama run gpt-5` or your CLI.
+    "gpt_cli_cmd": "python3 -c 'import sys;print(*sys.stdin, end=\"\")'",
+    "gcc_cmd": "gcc"
+}
+CFG_PATH = CFG_DIR / "config.json"
+
+def load_cfg():
+    if CFG_PATH.exists():
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULTS, **data}
+        except Exception:
+            pass
+    return DEFAULTS.copy()
+
+def save_cfg(cfg: dict):
+    try:
+        CFG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------- Themes ----------
+LIGHT = {
+    "bg": "#ffffff", "fg": "#1e1e1e", "sel_bg": "#cde8ff", "sel_fg": "#000000",
+    "cursor": "#222222", "console_bg": "#fafafa", "console_fg": "#111111",
+    "toolbar_bg": "#e9e9e9", "status_bg": "#efefef", "status_fg": "#333333",
+    "search_bg": "#fff7a8", "search_fg": "#000000",
+    "gutter_bg": "#f3f3f3", "gutter_fg": "#666666"
+}
+DARK = {
+    "bg": "#1e1e1e", "fg": "#d4d4d4", "sel_bg": "#264f78", "sel_fg": "#ffffff",
+    "cursor": "#cccccc", "console_bg": "#111317", "console_fg": "#d6dde6",
+    "toolbar_bg": "#2b2d31", "status_bg": "#2b2d31", "status_fg": "#c7c7c7",
+    "search_bg": "#574100", "search_fg": "#ffd866",
+    "gutter_bg": "#252526", "gutter_fg": "#8e8e8e"
+}
+
+class MiniNano(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1240x800")
+        self.minsize(840, 540)
+
+        # State
+        self.cfg = load_cfg()
+        self.theme = DARK if self.cfg.get("dark_mode", True) else LIGHT
+        self.filename: Path | None = None
+        self._modified = False
+        self._draft_path: Path | None = None
+        self.proc: subprocess.Popen | None = None      # run console
+        self.gpt_proc: subprocess.Popen | None = None  # gpt console
+        self.proc_lock = threading.Lock()
+        self.gpt_lock = threading.Lock()
+        self._autosave_job = None
+        self._ln_sched = False
+        self.chat_visible = False
+
+        # Dynamic consoles
+        self.consoles = []     # list of dicts for extra console tabs
+        self.console_count = 0
+
+        # UI
+        self._build_ui()
+        self._apply_theme()
+        self._bind_keys()
+        self.new_file()
+        if self.cfg.get("autosave"):
+            self._schedule_autosave()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        # Menu
+        menubar = tk.Menu(self)
+        file_m = tk.Menu(menubar, tearoff=False)
+        file_m.add_command(label="New", accelerator="Ctrl+N", command=self.new_file)
+        file_m.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_file)
+        file_m.add_separator()
+        file_m.add_command(label="Save", accelerator="Ctrl+S", command=self.save_file)
+        file_m.add_command(label="Save As…", command=self.save_file_as)
+        file_m.add_separator()
+        file_m.add_command(label="Run", accelerator="F5", command=self.run_current)
+        file_m.add_command(label="Stop", accelerator="Esc", command=self.stop_run)
+        file_m.add_separator()
+        file_m.add_command(label="Restart", command=self.restart_app)  # NEW
+        file_m.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_m)
+
+        view_m = tk.Menu(menubar, tearoff=False)
+        self.dark_mode_var = tk.BooleanVar(value=self.cfg.get("dark_mode", True))
+        view_m.add_checkbutton(label="Dark Mode", onvalue=True, offvalue=False,
+                               variable=self.dark_mode_var, command=self.toggle_dark_mode,
+                               accelerator="Ctrl+Shift+D")
+        self.chat_var = tk.BooleanVar(value=False)
+        view_m.add_checkbutton(label="Chat Panel", onvalue=True, offvalue=False,
+                               variable=self.chat_var, command=self.toggle_chat_panel)
+        menubar.add_cascade(label="View", menu=view_m)
+
+        help_m = tk.Menu(menubar, tearoff=False)
+        help_m.add_command(label="About", command=lambda: messagebox.showinfo(
+            "About MiniNano",
+            "MiniNano — dark mode, line numbers, undo/redo, autosave, interactive run, GPT-5 CLI, extra console tabs, GCC, restart."
+        ))
+        menubar.add_cascade(label="Help", menu=help_m)
+        self.config(menu=menubar)
+
+        # Toolbar
+        self.toolbar_outer = tk.Frame(self, bd=0, highlightthickness=0)
+        self.toolbar_outer.pack(side=tk.TOP, fill=tk.X)
+        self.toolbar = ttk.Frame(self.toolbar_outer, padding=(6, 6))
+        self.toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        self.btn_open = ttk.Button(self.toolbar, text="Open", command=self.open_file)
+        self.btn_save = ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_file)
+        self.btn_save_as = ttk.Button(self.toolbar, text="Save As…", command=self.save_file_as)
+        self.btn_undo = ttk.Button(self.toolbar, text="Undo (Ctrl+Z)", command=lambda: self.text.event_generate("<<Undo>>"))
+        self.btn_redo = ttk.Button(self.toolbar, text="Redo (Ctrl+Y)", command=lambda: self.text.event_generate("<<Redo>>"))
+        self.btn_run = ttk.Button(self.toolbar, text="Run (F5)", command=self.run_current)
+        self.btn_stop = ttk.Button(self.toolbar, text="Stop", command=self.stop_run, state=tk.DISABLED)
+        self.btn_copyall = ttk.Button(self.toolbar, text="Copy All", command=self.copy_all)
+        self.btn_restart = ttk.Button(self.toolbar, text="Restart", command=self.restart_app)  # NEW
+        self.btn_newtab = ttk.Button(self.toolbar, text="New Console Tab", command=self.new_console_tab)  # NEW
+
+        for w in (self.btn_open, self.btn_save, self.btn_save_as, self.btn_undo, self.btn_redo,
+                  self.btn_run, self.btn_stop, self.btn_copyall, self.btn_restart, self.btn_newtab):
+            w.pack(side=tk.LEFT, padx=(0, 6))
+
+        # Auto-save controls
+        self.autosave_var = tk.BooleanVar(value=self.cfg.get("autosave", False))
+        ttk.Checkbutton(self.toolbar, text="Auto-Save", variable=self.autosave_var,
+                        command=self._toggle_autosave).pack(side=tk.LEFT, padx=(6, 3))
+        ttk.Label(self.toolbar, text="every").pack(side=tk.LEFT, padx=(0, 3))
+        self.autosave_interval_var = tk.IntVar(value=int(self.cfg.get("autosave_interval_sec", 10)))
+        self.spin_interval = ttk.Spinbox(self.toolbar, from_=3, to=3600, width=5,
+                                         textvariable=self.autosave_interval_var,
+                                         command=self._apply_autosave_interval)
+        self.spin_interval.pack(side=tk.LEFT)
+        ttk.Label(self.toolbar, text="s").pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(self.toolbar, text="Run cmd:").pack(side=tk.LEFT)
+        self.run_cmd_var = tk.StringVar(value="")
+        self.run_cmd_entry = ttk.Entry(self.toolbar, textvariable=self.run_cmd_var, width=44)
+        self.run_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+
+        # ===== Split layout using PanedWindows =====
+        # Root split: top (workspace) vs bottom (consoles)
+        self.root_paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        self.root_paned.pack(fill=tk.BOTH, expand=True)
+
+        # Top workspace: editor (left) + optional chat (right)
+        self.top_paned = ttk.PanedWindow(self.root_paned, orient=tk.HORIZONTAL)
+        self.root_paned.add(self.top_paned, weight=5)
+
+        # --- Editor side (with gutter)
+        editor_outer = ttk.Frame(self.top_paned)
+        self.top_paned.add(editor_outer, weight=5)
+
+        self.gutter = tk.Text(editor_outer, width=6, padx=6, takefocus=False,
+                              state=tk.DISABLED, wrap="none", font=MONO_FONT, bd=0, highlightthickness=0)
+        self.gutter.pack(side=tk.LEFT, fill=tk.Y)
+
+        editor_frame = ttk.Frame(editor_outer)
+        editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.text = tk.Text(editor_frame, wrap="none", undo=True, font=MONO_FONT, tabs=("1c",), insertwidth=2)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll = ttk.Scrollbar(editor_frame, orient="vertical", command=self._yview_both)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.configure(yscrollcommand=lambda *a: self._yscrollcommand(yscroll, *a))
+
+        # --- Chat holder (not added until toggled)
+        self.chat_holder = ttk.Frame(self.top_paned)
+
+        # --- Bottom consoles notebook
+        self.console_tabs = ttk.Notebook(self.root_paned)
+        self.root_paned.add(self.console_tabs, weight=2)
+
+        # Run Console tab
+        run_frame = ttk.Frame(self.console_tabs)
+        rf_top = ttk.Frame(run_frame)
+        rf_top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.console = tk.Text(rf_top, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.console.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.console.insert("1.0", "")
+        self.console.configure(state=tk.DISABLED)
+        cy = ttk.Scrollbar(rf_top, orient="vertical", command=self.console.yview)
+        cy.pack(side=tk.RIGHT, fill=tk.Y)
+        self.console.configure(yscrollcommand=cy.set)
+
+        rf_bottom = ttk.Frame(run_frame, padding=(0,6))
+        rf_bottom.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(rf_bottom, text="Input:").pack(side=tk.LEFT, padx=(0, 6))
+        self.input_entry = tk.Text(rf_bottom, height=2, font=MONO_FONT, wrap="word")
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(rf_bottom, text="Send (Enter)", command=self.send_input).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(rf_bottom, text="Ctrl-C (SIGINT)", command=self.send_sigint).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(rf_bottom, text="EOF (Ctrl-D)", command=self.send_eof).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(rf_bottom, text="Clear", command=lambda: self.input_entry.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=(0,6))
+        self.console_tabs.add(run_frame, text="Run Console")
+
+        # GPT-5 CLI tab
+        gpt_frame = ttk.Frame(self.console_tabs)
+        gf_top = ttk.Frame(gpt_frame)
+        gf_top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.gpt_output = tk.Text(gf_top, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.gpt_output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        gcy = ttk.Scrollbar(gf_top, orient="vertical", command=self.gpt_output.yview)
+        gcy.pack(side=tk.RIGHT, fill=tk.Y)
+        self.gpt_output.configure(yscrollcommand=gcy.set)
+
+        gf_bottom = ttk.Frame(gpt_frame, padding=(0,6))
+        gf_bottom.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(gf_bottom, text="GPT-5 cmd:").pack(side=tk.LEFT, padx=(0, 6))
+        self.gpt_cmd_var = tk.StringVar(value=self.cfg.get("gpt_cli_cmd", DEFAULTS["gpt_cli_cmd"]))
+        self.gpt_cmd_entry = ttk.Entry(gf_bottom, textvariable=self.gpt_cmd_var, width=50)
+        self.gpt_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Save Cmd", command=self._save_gpt_cmd).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(gf_bottom, text="Prompt:").pack(side=tk.LEFT, padx=(0, 6))
+        self.gpt_input = ttk.Entry(gf_bottom, width=40)
+        self.gpt_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Send (Enter)", command=self.send_gpt).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Stop", command=self.stop_gpt).pack(side=tk.LEFT, padx=(0, 6))
+        self.console_tabs.add(gpt_frame, text="GPT-5 CLI")
+
+        # GCC tab (NEW)
+        self._build_gcc_tab()
+
+        # Status
+        self.status_outer = tk.Frame(self, bd=0, highlightthickness=0)
+        self.status_outer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status = ttk.Label(self.status_outer, anchor="w", padding=(6, 3))
+        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Search highlight tag
+        self.text.tag_configure("search_hit", background="#ffd54f", foreground="black")
+
+        # Bindings for editor/scroll and inputs
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<KeyRelease>", lambda e: (self._update_title_status(), self._schedule_line_numbers()))
+        self.text.bind("<ButtonRelease-1>", lambda e: (self._update_title_status(), self._schedule_line_numbers()))
+        self.text.bind("<Configure>", lambda e: self._schedule_line_numbers())
+        self.text.bind("<MouseWheel>", lambda e: self._schedule_line_numbers())
+        self.text.bind("<Button-4>", lambda e: self._schedule_line_numbers())  # X11 scroll up
+        self.text.bind("<Button-5>", lambda e: self._schedule_line_numbers())  # X11 scroll down
+
+        self.input_entry.bind("<Return>", self._input_enter)
+        self.input_entry.bind("<Shift-Return>", self._input_newline)
+        self.input_entry.bind("<Control-d>", self._input_ctrl_d)
+        self.gpt_input.bind("<Return>", lambda e: (self.send_gpt(), "break"))
+
+    def _build_gcc_tab(self):
+        gcc_frame = ttk.Frame(self.console_tabs, padding=(6,6))
+        self.console_tabs.add(gcc_frame, text="GCC")
+
+        row = 0
+        # GCC command
+        ttk.Label(gcc_frame, text="gcc cmd:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.gcc_cmd_var = tk.StringVar(value=self.cfg.get("gcc_cmd", DEFAULTS["gcc_cmd"]))
+        self.gcc_cmd_entry = ttk.Entry(gcc_frame, textvariable=self.gcc_cmd_var, width=20)
+        self.gcc_cmd_entry.grid(row=row, column=1, sticky="we", padx=4, pady=4)
+        ttk.Button(gcc_frame, text="Save", command=self._save_gcc_cmd).grid(row=row, column=2, padx=4, pady=4)
+
+        # Source selection
+        row += 1
+        self.use_current_c_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="Use current buffer (.c)", variable=self.use_current_c_var)\
+            .grid(row=row, column=0, sticky="w", padx=4, pady=4, columnspan=2)
+        ttk.Button(gcc_frame, text="Choose .c file…", command=self._choose_c_file)\
+            .grid(row=row, column=2, padx=4, pady=4)
+        self.c_source_path = tk.StringVar(value="")
+
+        # Build dir
+        row += 1
+        ttk.Label(gcc_frame, text="Build dir:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.build_dir_var = tk.StringVar(value=str((Path.cwd() / "build").resolve()))
+        self.build_dir_entry = ttk.Entry(gcc_frame, textvariable=self.build_dir_var, width=36)
+        self.build_dir_entry.grid(row=row, column=1, sticky="we", padx=4, pady=4)
+        ttk.Button(gcc_frame, text="Browse…", command=self._choose_build_dir)\
+            .grid(row=row, column=2, padx=4, pady=4)
+
+        # Output base name
+        row += 1
+        ttk.Label(gcc_frame, text="Output base name:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.output_base_var = tk.StringVar(value="a.out")
+        ttk.Entry(gcc_frame, textvariable=self.output_base_var, width=24)\
+            .grid(row=row, column=1, sticky="we", padx=4, pady=4)
+
+        # Flags row
+        row += 1
+        ttk.Label(gcc_frame, text="Standard:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.std_var = tk.StringVar(value="c11")
+        std_combo = ttk.Combobox(gcc_frame, textvariable=self.std_var, values=["c99", "c11", "c17", "gnu11", "gnu17"], width=8, state="readonly")
+        std_combo.grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(gcc_frame, text="Optimization:").grid(row=row, column=2, sticky="e", padx=4, pady=4)
+        self.opt_var = tk.StringVar(value="-O0")
+        opt_combo = ttk.Combobox(gcc_frame, textvariable=self.opt_var, values=["-O0", "-O1", "-O2", "-O3", "-Ofast"], width=8, state="readonly")
+        opt_combo.grid(row=row, column=3, sticky="w", padx=4, pady=4)
+
+        # Warnings & debug
+        row += 1
+        self.wall_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="-Wall -Wextra", variable=self.wall_var).grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.debug_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="-g (debug)", variable=self.debug_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(gcc_frame, text="Extra flags:").grid(row=row, column=2, sticky="e", padx=4, pady=4)
+        self.extra_flags_var = tk.StringVar(value="")
+        ttk.Entry(gcc_frame, textvariable=self.extra_flags_var, width=30).grid(row=row, column=3, sticky="we", padx=4, pady=4)
+
+        # Outputs selection
+        row += 1
+        ttk.Label(gcc_frame, text="Outputs:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.out_exec_var = tk.BooleanVar(value=True)
+        self.out_obj_var = tk.BooleanVar(value=False)
+        self.out_asm_var = tk.BooleanVar(value=False)
+        self.out_pre_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(gcc_frame, text="Executable", variable=self.out_exec_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(gcc_frame, text="Object (.o)", variable=self.out_obj_var).grid(row=row, column=2, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(gcc_frame, text="Assembly (.s)", variable=self.out_asm_var).grid(row=row, column=3, sticky="w", padx=4, pady=4)
+        row += 1
+        ttk.Checkbutton(gcc_frame, text="Preprocessed (.i)", variable=self.out_pre_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        # Build buttons
+        row += 1
+        ttk.Button(gcc_frame, text="Compile", command=self._gcc_compile).grid(row=row, column=0, padx=4, pady=8, sticky="w")
+        ttk.Button(gcc_frame, text="Open Build Dir", command=self._open_build_dir).grid(row=row, column=1, padx=4, pady=8, sticky="w")
+
+        # Output log
+        row += 1
+        self.gcc_log = tk.Text(gcc_frame, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.gcc_log.grid(row=row, column=0, columnspan=4, sticky="nsew", padx=2, pady=2)
+        gscroll = ttk.Scrollbar(gcc_frame, orient="vertical", command=self.gcc_log.yview)
+        gscroll.grid(row=row, column=4, sticky="ns")
+        self.gcc_log.configure(yscrollcommand=gscroll.set)
+        gcc_frame.grid_columnconfigure(1, weight=1)
+        gcc_frame.grid_columnconfigure(3, weight=1)
+        gcc_frame.grid_rowconfigure(row, weight=1)
+
+    # Chat panel (toggle + send to run console)
+    def toggle_chat_panel(self):
+        if self.chat_visible:
+            self.top_paned.forget(self.chat_holder)
+            for w in self.chat_holder.winfo_children():
+                w.destroy()
+            self.chat_visible = False
+        else:
+            self.chat_holder = ttk.Frame(self.top_paned)
+            self.top_paned.add(self.chat_holder, weight=2)
+            chat_toolbar = ttk.Frame(self.chat_holder)
+            chat_toolbar.pack(side=tk.TOP, fill=tk.X)
+            ttk.Label(chat_toolbar, text="Chat").pack(side=tk.LEFT, padx=(0,6))
+            ttk.Button(chat_toolbar, text="Send to Run (Ctrl+Enter)", command=self.chat_send_to_run).pack(side=tk.LEFT)
+            self.chat_box = tk.Text(self.chat_holder, width=36, wrap="word", font=MONO_FONT, insertwidth=2)
+            self.chat_box.pack(fill=tk.BOTH, expand=True)
+            self.chat_box.bind("<Control-Return>", lambda e: (self.chat_send_to_run(), "break"))
+            self.chat_visible = True
+            self._apply_theme()
+
+    def chat_send_to_run(self):
+        if not hasattr(self, "chat_box"):
+            return
+        try:
+            data = self.chat_box.get("sel.first", "sel.last")
+        except tk.TclError:
+            data = self.chat_box.get("insert linestart", "insert lineend")
+        data = data.strip()
+        if not data:
+            self.status.config(text="[Chat → Run] Nothing to send")
+            return
+        self._console_write(f"> {data}\n")
+        with self.proc_lock:
+            if self.proc and self.proc.stdin:
+                try:
+                    self.proc.stdin.write(data + "\n")
+                    self.proc.stdin.flush()
+                except Exception as e:
+                    self._console_write(f"[input error] {e}\n")
+            else:
+                self._console_write("[no process running]\n")
+
+    # ---------- Bind keys ----------
+    def _bind_keys(self):
+        self.bind_all("<Control-s>", lambda e: (self.save_file(), "break"))
+        self.bind_all("<Control-S>", lambda e: (self.save_file(), "break"))
+        self.bind_all("<Control-o>", lambda e: (self.open_file(), "break"))
+        self.bind_all("<Control-n>", lambda e: (self.new_file(), "break"))
+
+        self.bind_all("<Control-a>", self._select_all)
+        self.bind_all("<Control-A>", self._select_all)
+        self.bind_all("<Control-f>", lambda e: (self._find_popup(), "break"))
+        self.bind_all("<Control-F>", lambda e: (self._find_popup(), "break"))
+        self.bind_all("<Control-k>", lambda e: (self._cut_current_line(), "break"))
+        self.bind_all("<Control-K>", self._cut_current_line)
+        self.bind_all("<Control-c>", lambda e: (self.text.event_generate("<<Copy>>"), "break"))
+        self.bind_all("<Control-C>", lambda e: (self.text.event_generate("<<Copy>>"), "break"))
+        self.bind_all("<Control-v>", lambda e: (self.text.event_generate("<<Paste>>"), "break"))
+        self.bind_all("<Control-V>", lambda e: (self.text.event_generate("<<Paste>>"), "break"))
+
+        self.bind_all("<Control-z>", lambda e: (self.text.event_generate("<<Undo>>"), "break"))
+        self.bind_all("<Control-y>", lambda e: (self.text.event_generate("<<Redo>>"), "break"))
+        self.bind_all("<Control-Shift-C>", lambda e: (self.copy_all(), "break"))
+        self.bind_all("<F5>", lambda e: (self.run_current(), "break"))
+        self.bind_all("<Escape>", lambda e: (self.stop_run(), "break"))
+        self.bind_all("<Control-Shift-D>", lambda e: (self.toggle_dark_mode(), "break"))
+
+    # ---------- Theme ----------
+    def toggle_dark_mode(self):
+        self.cfg["dark_mode"] = not self.cfg.get("dark_mode", True)
+        save_cfg(self.cfg)
+        self.theme = DARK if self.cfg["dark_mode"] else LIGHT
+        self._apply_theme()
+        self._schedule_line_numbers()
+
+    def _apply_theme(self):
+        t = self.theme
+        self.configure(bg=t["bg"])
+        self.toolbar_outer.configure(bg=t["toolbar_bg"])
+        self.status_outer.configure(bg=t["status_bg"])
+        self.text.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"],
+                            selectbackground=t["sel_bg"], selectforeground=t["sel_fg"])
+        self.gutter.configure(state=tk.NORMAL, bg=t["gutter_bg"], fg=t["gutter_fg"])
+        self.gutter.delete("1.0", tk.END)
+        self.gutter.configure(state=tk.DISABLED)
+        self.console.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        self.input_entry.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"], bd=1, highlightthickness=1)
+        self.gpt_output.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        if hasattr(self, "gcc_log"):
+            self.gcc_log.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        if self.chat_visible and hasattr(self, "chat_box"):
+            self.chat_box.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+        # dynamic consoles theme
+        for c in self.consoles:
+            c["text"].configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+            c["input"].configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+
+        self.status.configure(background=t["status_bg"], foreground=t["status_fg"])
+        style = ttk.Style()
+        for base in ("clam", "alt", "default"):
+            if base in style.theme_names():
+                style.theme_use(base); break
+        style.configure("TFrame", background=t["bg"])
+        style.configure("TLabel", background=t["bg"], foreground=t["fg"])
+        style.configure("TButton", padding=6)
+        style.configure("TEntry", fieldbackground=t["bg"], foreground=t["fg"])
+        style.configure("Tool.TFrame", background=t["toolbar_bg"])
+        style.configure("TPanedwindow", sashrelief="flat")
+        self.toolbar.configure(style="Tool.TFrame")
+
+    # ---------- File ops ----------
+    def new_file(self):
+        if not self._maybe_save_changes(): return
+        self.filename = None
+        self._draft_path = None
+        self.text.delete("1.0", tk.END)
+        self._modified = False
+        self._update_title_status()
+        self._auto_fill_run_cmd()
+        self._schedule_line_numbers()
+
+    def open_file(self):
+        if not self._maybe_save_changes(): return
+        path = filedialog.askopenfilename(title="Open file")
+        if not path: return
+        try:
+            data = Path(path).read_text(encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Open failed", f"{e}")
+            return
+        self.filename = Path(path)
+        self._draft_path = None
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", data)
+        self._modified = False
+        self._update_title_status()
+        self._auto_fill_run_cmd()
+        self._schedule_line_numbers()
+
+    def save_file(self):
+        if self.filename is None:
+            return self.save_file_as()
+        try:
+            data = self.text.get("1.0", tk.END)
+            self.filename.write_text(data.rstrip("\n") + "\n", encoding="utf-8")
+            self._modified = False
+            self._update_title_status()
+            self.status.config(text=f"Saved to {self.filename}")
+            return True
+        except Exception as e:
+            messagebox.showerror("Save failed", f"{e}")
+            return False
+
+    def save_file_as(self):
+        path = filedialog.asksaveasfilename(title="Save As", defaultextension="",
+                                            initialfile=(self.filename.name if self.filename else "untitled.txt"))
+        if not path: return False
+        self.filename = Path(path)
+        self._draft_path = None
+        self._auto_fill_run_cmd()
+        return self.save_file()
+
+    # ---------- Restart ----------
+    def restart_app(self):
+        """Restart the IDE by re-executing the Python process."""
+        if not self._maybe_save_changes():
+            return
+        try:
+            self.stop_run()
+            self.stop_gpt()
+            self._stop_all_extra_consoles()
+        except Exception:
+            pass
+        python = sys.executable
+        args = [python] + sys.argv
+        self.destroy()
+        os.execv(python, args)
+
+    # ---------- Edit ops ----------
+    def _select_all(self, event=None):
+        self.text.tag_add(tk.SEL, "1.0", tk.END)
+        self.text.mark_set(tk.INSERT, "1.0")
+        self.text.see(tk.INSERT)
+        return "break"
+
+    def _cut_current_line(self, event=None):
+        index = self.text.index(tk.INSERT)
+        line, _ = map(int, index.split("."))
+        start, end = f"{line}.0", f"{line + 1}.0"
+        content = self.text.get(start, end)
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.text.delete(start, end)
+        self._modified = True
+        self._update_title_status()
+        self._schedule_line_numbers()
+        return "break"
+
+    def copy_all(self):
+        data = self.text.get("1.0", tk.END).rstrip()
+        self.clipboard_clear()
+        self.clipboard_append(data)
+        self.status.config(text="[All code copied]")
+        self.after(1500, self._update_title_status)
+
+    # ---------- Find ----------
+    def _find_popup(self):
+        popup = tk.Toplevel(self); popup.title("Find"); popup.transient(self); popup.grab_set()
+        frm = ttk.Frame(popup, padding=8); frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Find:").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        var = tk.StringVar(); ent = ttk.Entry(frm, textvariable=var, width=40)
+        ent.grid(row=0, column=1, padx=6, pady=6)
+        def do_find():
+            self.text.tag_remove("search_hit", "1.0", tk.END)
+            needle = var.get()
+            if not needle: return
+            start = "1.0"
+            while True:
+                pos = self.text.search(needle, start, stopindex=tk.END, nocase=1)
+                if not pos: break
+                self.text.tag_add("search_hit", pos, f"{pos}+{len(needle)}c")
+                start = f"{pos}+1c"
+        ttk.Button(frm, text="Find All", command=do_find).grid(row=0, column=2, padx=6, pady=6)
+        ent.focus_set()
+
+    # ---------- Run console ----------
+    def run_current(self):
+        if self.proc is not None:
+            messagebox.showwarning("Running", "A process is already running. Stop it first.")
+            return
+        if self.filename is None:
+            choice = messagebox.askyesnocancel("Save file?",
+                "This buffer has never been saved.\nYes = Save As and run\nNo = Run a temp copy\nCancel = Abort")
+            if choice is None: return
+            if choice:
+                if not self.save_file_as(): return
+            else:
+                tmp = Path(AUTOSAVE_DIR / f"temp-{int(time.time())}.txt")
+                tmp.write_text(self.text.get("1.0", tk.END), encoding="utf-8")
+                self._start_process_for_path(tmp, temp_mode=True); return
+        else:
+            if self._modified and not self.save_file(): return
+        self._start_process_for_path(self.filename, temp_mode=False)
+
+    def _start_process_for_path(self, path: Path, temp_mode: bool):
+        cmd = self._compute_run_cmd_for(path)
+        override = self.run_cmd_var.get().strip()
+        if override:
+            cmd = override.replace("{file}", str(path))
+        self._console_clear()
+        self._console_write(f"$ {cmd}\n\n")
+        try:
+            with self.proc_lock:
+                self.proc = subprocess.Popen(
+                    cmd, shell=True, cwd=str(path.parent),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE, text=True, bufsize=1
+                )
+            self.btn_run.configure(state=tk.DISABLED)
+            self.btn_stop.configure(state=tk.NORMAL)
+            self.input_entry.focus_set()
+            threading.Thread(target=self._pump_output, daemon=True).start()
+        except Exception as e:
+            self._console_write(f"[error] {e}\n")
+
+        if temp_mode:
+            def cleanup_when_done():
+                if self.proc is None:
+                    try: path.unlink(missing_ok=True)
+                    except Exception: pass
+                else:
+                    self.after(500, cleanup_when_done)
+            self.after(500, cleanup_when_done)
+
+    def stop_run(self):
+        with self.proc_lock:
+            if self.proc is None: return
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+    def _pump_output(self):
+        p = self.proc; assert p is not None
+        try:
+            for line in p.stdout:
+                self._console_write(line)
+        except Exception as e:
+            self._console_write(f"\n[stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self._console_write(f"\n[process exited with code {rc}]\n")
+            with self.proc_lock:
+                self.proc = None
+            self.after(0, lambda: (self.btn_run.configure(state=tk.NORMAL),
+                                   self.btn_stop.configure(state=tk.DISABLED)))
+
+    # input helpers (Run Console)
+    def _input_enter(self, event):
+        self.send_input(); return "break"
+    def _input_newline(self, event):
+        self.input_entry.insert(tk.INSERT, "\n"); return "break"
+    def _input_ctrl_d(self, event):
+        self.send_eof(); return "break"
+
+    def send_input(self):
+        text = self.input_entry.get("1.0", tk.END)
+        if not text.strip() and text != "\n":
+            return
+        self._console_write(f"> {text}")
+        with self.proc_lock:
+            if self.proc and self.proc.stdin:
+                try:
+                    self.proc.stdin.write(text)
+                    if not text.endswith("\n"): self.proc.stdin.write("\n")
+                    self.proc.stdin.flush()
+                except Exception as e:
+                    self._console_write(f"\n[input error] {e}\n")
+            else:
+                self._console_write("[no process running]\n")
+        self.input_entry.delete("1.0", tk.END)
+
+    def send_sigint(self):
+        with self.proc_lock:
+            if self.proc is None: return
+            try:
+                os.kill(self.proc.pid, signal.SIGINT)
+                self._console_write("\n[sent SIGINT]\n")
+            except Exception as e:
+                self._console_write(f"\n[sigint error] {e}\n")
+
+    def send_eof(self):
+        with self.proc_lock:
+            if self.proc is None or self.proc.stdin is None: return
+            try:
+                self.proc.stdin.close()
+                self._console_write("\n[stdin closed — sent EOF]\n")
+            except Exception as e:
+                self._console_write(f"\n[eof error] {e}\n")
+
+    def _console_clear(self):
+        self.console.configure(state=tk.NORMAL)
+        self.console.delete("1.0", tk.END)
+        self.console.configure(state=tk.DISABLED)
+
+    def _console_write(self, text: str):
+        self.console.configure(state=tk.NORMAL)
+        self.console.insert(tk.END, text)
+        self.console.see(tk.END)
+        self.console.configure(state=tk.DISABLED)
+
+    # ---------- Extra Console Tabs ----------
+    def new_console_tab(self):
+        """Create a new interactive shell console tab."""
+        self.console_count += 1
+        tab_name = f"Console {self.console_count}"
+        frame = ttk.Frame(self.console_tabs)
+
+        # Output view
+        top = ttk.Frame(frame)
+        top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        text = tk.Text(top, height=12, wrap="word", state=tk.DISABLED, font=MONO_FONT)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(top, orient="vertical", command=text.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=scroll.set)
+
+        # Input row
+        bottom = ttk.Frame(frame, padding=(0,6))
+        bottom.pack(side=tk.TOP, fill=tk.X)
+        inp = tk.Text(bottom, height=2, font=MONO_FONT, wrap="word")
+        inp.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        send_btn = ttk.Button(bottom, text="Send (Enter)")
+        sig_btn = ttk.Button(bottom, text="Ctrl-C")
+        eof_btn = ttk.Button(bottom, text="EOF")
+        clr_btn = ttk.Button(bottom, text="Clear")
+        send_btn.pack(side=tk.LEFT, padx=(0,6))
+        sig_btn.pack(side=tk.LEFT, padx=(0,6))
+        eof_btn.pack(side=tk.LEFT, padx=(0,6))
+        clr_btn.pack(side=tk.LEFT, padx=(0,6))
+
+        # Launch shell
+        try:
+            proc = subprocess.Popen(
+                "bash",
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+        except Exception as e:
+            text.configure(state=tk.NORMAL); text.insert(tk.END, f"[Error launching shell: {e}]\n")
+            text.configure(state=tk.DISABLED)
+            return
+
+        lock = threading.Lock()
+        console = {"frame": frame, "text": text, "input": inp, "proc": proc, "lock": lock}
+        self.consoles.append(console)
+
+        # Wire buttons/bindings
+        def send():
+            data = inp.get("1.0", tk.END).rstrip()
+            inp.delete("1.0", tk.END)
+            if not data: return
+            self._console_write_to(console, f"> {data}\n")
+            with lock:
+                try:
+                    proc.stdin.write(data + "\n")
+                    proc.stdin.flush()
+                except Exception as ex:
+                    self._console_write_to(console, f"[input error] {ex}\n")
+        def sig():
+            try:
+                os.kill(proc.pid, signal.SIGINT)
+                self._console_write_to(console, "\n[sent SIGINT]\n")
+            except Exception as ex:
+                self._console_write_to(console, f"\n[sigint error] {ex}\n")
+        def eof():
+            try:
+                proc.stdin.close()
+                self._console_write_to(console, "\n[stdin closed — sent EOF]\n")
+            except Exception as ex:
+                self._console_write_to(console, f"\n[eof error] {ex}\n")
+        def clr():
+            text.configure(state=tk.NORMAL); text.delete("1.0", tk.END); text.configure(state=tk.DISABLED)
+
+        send_btn.configure(command=send)
+        sig_btn.configure(command=sig)
+        eof_btn.configure(command=eof)
+        clr_btn.configure(command=clr)
+        inp.bind("<Return>", lambda e: (send(), "break"))
+        inp.bind("<Shift-Return>", lambda e: (inp.insert(tk.INSERT, "\n"), "break"))
+        inp.bind("<Control-d>", lambda e: (eof(), "break"))
+
+        # Theme for this console
+        t = self.theme
+        text.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        inp.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+
+        self.console_tabs.add(frame, text=tab_name)
+        self.console_tabs.select(frame)
+
+        threading.Thread(target=self._pump_console_output, args=(console,), daemon=True).start()
+
+    def _pump_console_output(self, console):
+        p = console["proc"]
+        try:
+            for line in p.stdout:
+                self._console_write_to(console, line)
+        except Exception as e:
+            self._console_write_to(console, f"\n[stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self._console_write_to(console, f"\n[process exited with code {rc}]\n")
+
+    def _console_write_to(self, console, text: str):
+        t = console["text"]
+        t.configure(state=tk.NORMAL)
+        t.insert(tk.END, text)
+        t.see(tk.END)
+        t.configure(state=tk.DISABLED)
+
+    def _stop_all_extra_consoles(self):
+        for c in self.consoles:
+            try:
+                if c["proc"]:
+                    c["proc"].terminate()
+            except Exception:
+                pass
+
+    # ---------- GPT-5 CLI tab ----------
+    def _save_gpt_cmd(self):
+        self.cfg["gpt_cli_cmd"] = self.gpt_cmd_var.get().strip() or DEFAULTS["gpt_cli_cmd"]
+        save_cfg(self.cfg)
+        self.gpt_output.insert(tk.END, f"[Saved GPT cmd] {self.cfg['gpt_cli_cmd']}\n")
+        self.gpt_output.see(tk.END)
+
+    def send_gpt(self):
+        prompt = self.gpt_input.get().strip()
+        if not prompt: return
+        self.gpt_input.delete(0, tk.END)
+        self.gpt_output.insert(tk.END, f"\n> {prompt}\n")
+        self.gpt_output.see(tk.END)
+
+        cmd = self.gpt_cmd_var.get().strip() or DEFAULTS["gpt_cli_cmd"]
+        try:
+            with self.gpt_lock:
+                self.gpt_proc = subprocess.Popen(
+                    cmd, shell=True, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                self.gpt_proc.stdin.write(prompt + "\n")
+                self.gpt_proc.stdin.close()
+            threading.Thread(target=self._pump_gpt_output, daemon=True).start()
+        except Exception as e:
+            self.gpt_output.insert(tk.END, f"[Error launching GPT CLI: {e}]\n")
+
+    def _pump_gpt_output(self):
+        p = self.gpt_proc
+        if p is None: return
+        try:
+            for line in p.stdout:
+                self.gpt_output.insert(tk.END, line)
+                self.gpt_output.see(tk.END)
+        except Exception as e:
+            self.gpt_output.insert(tk.END, f"\n[gpt stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self.gpt_output.insert(tk.END, f"\n[GPT process exited with code {rc}]\n")
+            with self.gpt_lock:
+                self.gpt_proc = None
+
+    def stop_gpt(self):
+        with self.gpt_lock:
+            if not self.gpt_proc: return
+            try:
+                self.gpt_proc.terminate()
+                self.gpt_output.insert(tk.END, "\n[Stopped GPT process]\n")
+            except Exception as e:
+                self.gpt_output.insert(tk.END, f"\n[gpt stop error] {e}\n")
+            self.gpt_proc = None
+
+    # ---------- GCC actions ----------
+    def _save_gcc_cmd(self):
+        self.cfg["gcc_cmd"] = self.gcc_cmd_var.get().strip() or DEFAULTS["gcc_cmd"]
+        save_cfg(self.cfg)
+        self._gcc_log_write(f"[Saved gcc cmd] {self.cfg['gcc_cmd']}\n")
+
+    def _choose_c_file(self):
+        path = filedialog.askopenfilename(title="Choose C source", filetypes=[("C source", "*.c"), ("All files", "*.*")])
+        if path:
+            self.c_source_path.set(path)
+            self.use_current_c_var.set(False)
+
+    def _choose_build_dir(self):
+        path = filedialog.askdirectory(title="Choose build directory")
+        if path:
+            self.build_dir_var.set(path)
+
+    def _open_build_dir(self):
+        d = self.build_dir_var.get().strip()
+        if not d: return
+        self._gcc_log_write(f"[Build dir] {d}\n")
+        # Leave to user to open in their file manager/terminal
+
+    def _gcc_log_write(self, text: str):
+        self.gcc_log.insert(tk.END, text)
+        self.gcc_log.see(tk.END)
+
+    def _gcc_compile(self):
+        gcc = self.gcc_cmd_var.get().strip() or "gcc"
+        # Resolve source
+        if self.use_current_c_var.get():
+            if not self.filename or self.filename.suffix.lower() != ".c":
+                messagebox.showerror("No C source", "Current buffer is not a saved .c file. Save as *.c or uncheck 'Use current buffer'.")
+                return
+            if self._modified and not self.save_file():
+                return
+            src = str(self.filename)
+            base_default = self.filename.stem
+        else:
+            src = self.c_source_path.get().strip()
+            if not src or not Path(src).exists():
+                messagebox.showerror("No C source", "Choose a valid .c file.")
+                return
+            base_default = Path(src).stem
+
+        build_dir = Path(self.build_dir_var.get().strip()).expanduser().resolve()
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        base = self.output_base_var.get().strip() or base_default
+        # Flags
+        flags = []
+        if self.std_var.get(): flags += [f"-std={self.std_var.get()}"]
+        if self.wall_var.get(): flags += ["-Wall", "-Wextra"]
+        if self.debug_var.get(): flags += ["-g"]
+        if self.opt_var.get(): flags += [self.opt_var.get()]
+        extra = self.extra_flags_var.get().strip()
+        if extra:
+            # simple split (user can put quoted flags if needed)
+            flags += shlex.split(extra)
+
+        # Outputs
+        wants = []
+        if self.out_exec_var.get(): wants.append(("exec", str(build_dir / base)))
+        if self.out_obj_var.get():  wants.append(("obj",  str(build_dir / f"{base}.o")))
+        if self.out_asm_var.get():  wants.append(("asm",  str(build_dir / f"{base}.s")))
+        if self.out_pre_var.get():  wants.append(("pre",  str(build_dir / f"{base}.i")))
+        if not wants:
+            messagebox.showinfo("Nothing to do", "Select at least one output format.")
+            return
+
+        self.gcc_log.delete("1.0", tk.END)
+        self._gcc_log_write(f"[gcc] {gcc}\n[src] {src}\n[build] {build_dir}\n[flags] {' '.join(flags) if flags else '(none)'}\n\n")
+
+        def run_cmd(cmd_list):
+            self._gcc_log_write("$ " + " ".join(shlex.quote(x) for x in cmd_list) + "\n")
+            try:
+                p = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=build_dir)
+                for line in p.stdout:
+                    self._gcc_log_write(line)
+                rc = p.wait()
+                self._gcc_log_write(f"[exit {rc}]\n\n")
+                return rc == 0
+            except Exception as e:
+                self._gcc_log_write(f"[spawn error] {e}\n\n")
+                return False
+
+        ok_all = True
+        for kind, outpath in wants:
+            if kind == "exec":
+                cmd = [gcc, src, "-o", outpath] + flags
+            elif kind == "obj":
+                cmd = [gcc, "-c", src, "-o", outpath] + flags
+            elif kind == "asm":
+                cmd = [gcc, "-S", src, "-o", outpath] + flags
+            elif kind == "pre":
+                # -E sends to stdout by default; -o writes to file, supported by gcc
+                cmd = [gcc, "-E", src, "-o", outpath] + flags
+            else:
+                continue
+            ok = run_cmd(cmd)
+            if ok:
+                self._gcc_log_write(f"[ok] wrote {outpath}\n\n")
+            ok_all = ok_all and ok
+
+        if ok_all:
+            self._gcc_log_write("[build] SUCCESS ✅\n")
+        else:
+            self._gcc_log_write("[build] DONE with errors ❌\n")
+
+    # ---------- Line numbers ----------
+    def _yview_both(self, *args):
+        self.text.yview(*args)
+        self.gutter.yview(*args)
+        self._schedule_line_numbers()
+
+    def _yscrollcommand(self, sb, first, last):
+        sb.set(first, last)
+        self.gutter.yview_moveto(first)
+        self._schedule_line_numbers()
+
+    def _schedule_line_numbers(self):
+        if self._ln_sched: return
+        self._ln_sched = True
+        self.after_idle(self._update_line_numbers)
+
+    def _update_line_numbers(self):
+        self._ln_sched = False
+        try:
+            first_index = self.text.index("@0,0")
+            last_index = self.text.index(f"@0,{self.text.winfo_height()}")
+        except Exception:
+            return
+        first_line = int(first_index.split(".")[0])
+        last_line = int(last_index.split(".")[0]) + 1
+        total_lines = int(self.text.index("end-1c").split(".")[0])
+        width = max(3, len(str(total_lines)) + 1)
+
+        self.gutter.configure(state=tk.NORMAL, width=width)
+        self.gutter.delete("1.0", tk.END)
+        blanks = "\n" * (first_line - 1)
+        self.gutter.insert("1.0", blanks)
+        for n in range(first_line, last_line + 1):
+            self.gutter.insert(f"{n}.0", f"{n}".rjust(width) + "\n")
+        self.gutter.configure(state=tk.DISABLED)
+        first, _ = self.text.yview()
+        self.gutter.yview_moveto(first)
+
+    # ---------- Autosave ----------
+    def _toggle_autosave(self):
+        self.cfg["autosave"] = bool(self.autosave_var.get())
+        save_cfg(self.cfg)
+        if self.cfg["autosave"]:
+            self._schedule_autosave()
+            self.status.config(text="[Auto-Save ON]")
+        else:
+            if self._autosave_job:
+                self.after_cancel(self._autosave_job)
+                self._autosave_job = None
+            self.status.config(text="[Auto-Save OFF]")
+
+    def _apply_autosave_interval(self):
+        try:
+            val = max(3, min(3600, int(self.autosave_interval_var.get())))
+            self.cfg["autosave_interval_sec"] = val
+            save_cfg(self.cfg)
+            if self.cfg.get("autosave"):
+                if self._autosave_job:
+                    self.after_cancel(self._autosave_job)
+                    self._autosave_job = None
+                self._schedule_autosave()
+        except Exception:
+            pass
+
+    def _schedule_autosave(self):
+        interval = int(self.cfg.get("autosave_interval_sec", 10)) * 1000
+        self._autosave_job = self.after(interval, self._do_autosave)
+
+    def _do_autosave(self):
+        try:
+            data = self.text.get("1.0", tk.END)
+            if self.filename:
+                path = self.filename
+            else:
+                if not self._draft_path:
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    self._draft_path = AUTOSAVE_DIR / f"draft-{ts}.txt"
+                path = self._draft_path
+            path.write_text(data.rstrip("\n") + "\n", encoding="utf-8")
+            self.status.config(text=f"[Auto-saved] {path}")
+        except Exception as e:
+            self.status.config(text=f"[Auto-save failed] {e}")
+        finally:
+            self._schedule_autosave()
+
+    # ---------- Helpers ----------
+    def _update_title_status(self):
+        name = (self.filename.name if self.filename else (self._draft_path.name if self._draft_path else "untitled"))
+        mod = " *" if self._modified else ""
+        self.title(f"{APP_TITLE} — {name}{mod}")
+        idx = self.text.index(tk.INSERT)
+        line, col = idx.split(".")
+        self.status.config(text=f"{name}{mod}   |   Line {line}, Col {int(col)+1}")
+
+    def _on_modified(self, event=None):
+        if self.text.edit_modified():
+            self._modified = True
+            self.text.edit_modified(False)
+        self._update_title_status()
+        self._schedule_line_numbers()
+
+    def _on_close(self):
+        if not self._maybe_save_changes(): return
+        self.stop_run()
+        self.stop_gpt()
+        self._stop_all_extra_consoles()
+        if self._autosave_job:
+            try: self.after_cancel(self._autosave_job)
+            except Exception: pass
+        self.destroy()
+
+    def _maybe_save_changes(self) -> bool:
+        if not self._modified:
+            return True
+        resp = messagebox.askyesnocancel("Unsaved changes", "Save changes before closing?")
+        if resp is None: return False
+        if resp: return bool(self.save_file())
+        return True
+
+    def _auto_fill_run_cmd(self):
+        if self.filename is None:
+            self.run_cmd_var.set("")
+        else:
+            self.run_cmd_var.set(self._compute_run_cmd_for(self.filename))
+
+    def _compute_run_cmd_for(self, path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext == ".py": return f'python3 "{path}"'
+        if ext == ".sh": return f'bash "{path}"'
+        if os.access(path, os.X_OK): return f'"{path}"'
+        return f'sh "{path}"'
+
+
+if __name__ == "__main__":
+    try:
+        style = ttk.Style()
+        for theme in ("clam", "alt", "default"):
+            if theme in style.theme_names():
+                style.theme_use(theme); break
+    except Exception:
+        pass
+    app = MiniNano()
+    app.mainloop()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MiniNano — nano-like IDE (Tkinter)
+Features:
+- View → Dark Mode toggle
+- View → Chat Panel toggle (scratchpad on the right; Ctrl+Enter sends selection/line to Run)
+- Line numbers gutter (kept in sync with scroll)
+- Undo/Redo buttons (+ Ctrl+Z / Ctrl+Y)
+- Copy All (+ Ctrl+Shift+C)
+- Auto-Save toggle + interval (drafts at ~/.config/mininano/autosaves/ if unsaved)
+- Resizable panes via splitters (editor↔chat horizontally, consoles below vertically)
+- Run Console (interactive: Send, SIGINT, EOF)
+- GPT-5 CLI Console (second tab) with editable command
+- NEW: Restart button & File → Restart menu to reboot the IDE (self-reload)
+- NEW: “New Console Tab” button — spawns independent shell consoles
+- NEW: GCC tab — compiles C source to Executable, .o, .s, .i with flags/output dir
+
+Linux deps: Python 3 + Tk
+"""
+
+import os, sys, threading, subprocess, signal, time, json, shlex
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+APP_TITLE = "MiniNano"
+MONO_FONT = ("DejaVu Sans Mono", 11)
+
+# ---------- Config ----------
+CFG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mininano"
+AUTOSAVE_DIR = CFG_DIR / "autosaves"
+for p in (CFG_DIR, AUTOSAVE_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+DEFAULTS = {
+    "dark_mode": True,
+    "autosave": False,
+    "autosave_interval_sec": 10,
+    # Safe demo default (echoes input). Replace in UI with: `ollama run gpt-5` or your CLI.
+    "gpt_cli_cmd": "python3 -c 'import sys;print(*sys.stdin, end=\"\")'",
+    "gcc_cmd": "gcc"
+}
+CFG_PATH = CFG_DIR / "config.json"
+
+def load_cfg():
+    if CFG_PATH.exists():
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULTS, **data}
+        except Exception:
+            pass
+    return DEFAULTS.copy()
+
+def save_cfg(cfg: dict):
+    try:
+        CFG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------- Themes ----------
+LIGHT = {
+    "bg": "#ffffff", "fg": "#1e1e1e", "sel_bg": "#cde8ff", "sel_fg": "#000000",
+    "cursor": "#222222", "console_bg": "#fafafa", "console_fg": "#111111",
+    "toolbar_bg": "#e9e9e9", "status_bg": "#efefef", "status_fg": "#333333",
+    "search_bg": "#fff7a8", "search_fg": "#000000",
+    "gutter_bg": "#f3f3f3", "gutter_fg": "#666666"
+}
+DARK = {
+    "bg": "#1e1e1e", "fg": "#d4d4d4", "sel_bg": "#264f78", "sel_fg": "#ffffff",
+    "cursor": "#cccccc", "console_bg": "#111317", "console_fg": "#d6dde6",
+    "toolbar_bg": "#2b2d31", "status_bg": "#2b2d31", "status_fg": "#c7c7c7",
+    "search_bg": "#574100", "search_fg": "#ffd866",
+    "gutter_bg": "#252526", "gutter_fg": "#8e8e8e"
+}
+
+class MiniNano(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1240x800")
+        self.minsize(840, 540)
+
+        # State
+        self.cfg = load_cfg()
+        self.theme = DARK if self.cfg.get("dark_mode", True) else LIGHT
+        self.filename: Path | None = None
+        self._modified = False
+        self._draft_path: Path | None = None
+        self.proc: subprocess.Popen | None = None      # run console
+        self.gpt_proc: subprocess.Popen | None = None  # gpt console
+        self.proc_lock = threading.Lock()
+        self.gpt_lock = threading.Lock()
+        self._autosave_job = None
+        self._ln_sched = False
+        self.chat_visible = False
+
+        # Dynamic consoles
+        self.consoles = []     # list of dicts for extra console tabs
+        self.console_count = 0
+
+        # UI
+        self._build_ui()
+        self._apply_theme()
+        self._bind_keys()
+        self.new_file()
+        if self.cfg.get("autosave"):
+            self._schedule_autosave()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        # Menu
+        menubar = tk.Menu(self)
+        file_m = tk.Menu(menubar, tearoff=False)
+        file_m.add_command(label="New", accelerator="Ctrl+N", command=self.new_file)
+        file_m.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_file)
+        file_m.add_separator()
+        file_m.add_command(label="Save", accelerator="Ctrl+S", command=self.save_file)
+        file_m.add_command(label="Save As…", command=self.save_file_as)
+        file_m.add_separator()
+        file_m.add_command(label="Run", accelerator="F5", command=self.run_current)
+        file_m.add_command(label="Stop", accelerator="Esc", command=self.stop_run)
+        file_m.add_separator()
+        file_m.add_command(label="Restart", command=self.restart_app)  # NEW
+        file_m.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_m)
+
+        view_m = tk.Menu(menubar, tearoff=False)
+        self.dark_mode_var = tk.BooleanVar(value=self.cfg.get("dark_mode", True))
+        view_m.add_checkbutton(label="Dark Mode", onvalue=True, offvalue=False,
+                               variable=self.dark_mode_var, command=self.toggle_dark_mode,
+                               accelerator="Ctrl+Shift+D")
+        self.chat_var = tk.BooleanVar(value=False)
+        view_m.add_checkbutton(label="Chat Panel", onvalue=True, offvalue=False,
+                               variable=self.chat_var, command=self.toggle_chat_panel)
+        menubar.add_cascade(label="View", menu=view_m)
+
+        help_m = tk.Menu(menubar, tearoff=False)
+        help_m.add_command(label="About", command=lambda: messagebox.showinfo(
+            "About MiniNano",
+            "MiniNano — dark mode, line numbers, undo/redo, autosave, interactive run, GPT-5 CLI, extra console tabs, GCC, restart."
+        ))
+        menubar.add_cascade(label="Help", menu=help_m)
+        self.config(menu=menubar)
+
+        # Toolbar
+        self.toolbar_outer = tk.Frame(self, bd=0, highlightthickness=0)
+        self.toolbar_outer.pack(side=tk.TOP, fill=tk.X)
+        self.toolbar = ttk.Frame(self.toolbar_outer, padding=(6, 6))
+        self.toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        self.btn_open = ttk.Button(self.toolbar, text="Open", command=self.open_file)
+        self.btn_save = ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_file)
+        self.btn_save_as = ttk.Button(self.toolbar, text="Save As…", command=self.save_file_as)
+        self.btn_undo = ttk.Button(self.toolbar, text="Undo (Ctrl+Z)", command=lambda: self.text.event_generate("<<Undo>>"))
+        self.btn_redo = ttk.Button(self.toolbar, text="Redo (Ctrl+Y)", command=lambda: self.text.event_generate("<<Redo>>"))
+        self.btn_run = ttk.Button(self.toolbar, text="Run (F5)", command=self.run_current)
+        self.btn_stop = ttk.Button(self.toolbar, text="Stop", command=self.stop_run, state=tk.DISABLED)
+        self.btn_copyall = ttk.Button(self.toolbar, text="Copy All", command=self.copy_all)
+        self.btn_restart = ttk.Button(self.toolbar, text="Restart", command=self.restart_app)  # NEW
+        self.btn_newtab = ttk.Button(self.toolbar, text="New Console Tab", command=self.new_console_tab)  # NEW
+
+        for w in (self.btn_open, self.btn_save, self.btn_save_as, self.btn_undo, self.btn_redo,
+                  self.btn_run, self.btn_stop, self.btn_copyall, self.btn_restart, self.btn_newtab):
+            w.pack(side=tk.LEFT, padx=(0, 6))
+
+        # Auto-save controls
+        self.autosave_var = tk.BooleanVar(value=self.cfg.get("autosave", False))
+        ttk.Checkbutton(self.toolbar, text="Auto-Save", variable=self.autosave_var,
+                        command=self._toggle_autosave).pack(side=tk.LEFT, padx=(6, 3))
+        ttk.Label(self.toolbar, text="every").pack(side=tk.LEFT, padx=(0, 3))
+        self.autosave_interval_var = tk.IntVar(value=int(self.cfg.get("autosave_interval_sec", 10)))
+        self.spin_interval = ttk.Spinbox(self.toolbar, from_=3, to=3600, width=5,
+                                         textvariable=self.autosave_interval_var,
+                                         command=self._apply_autosave_interval)
+        self.spin_interval.pack(side=tk.LEFT)
+        ttk.Label(self.toolbar, text="s").pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(self.toolbar, text="Run cmd:").pack(side=tk.LEFT)
+        self.run_cmd_var = tk.StringVar(value="")
+        self.run_cmd_entry = ttk.Entry(self.toolbar, textvariable=self.run_cmd_var, width=44)
+        self.run_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+
+        # ===== Split layout using PanedWindows =====
+        # Root split: top (workspace) vs bottom (consoles)
+        self.root_paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        self.root_paned.pack(fill=tk.BOTH, expand=True)
+
+        # Top workspace: editor (left) + optional chat (right)
+        self.top_paned = ttk.PanedWindow(self.root_paned, orient=tk.HORIZONTAL)
+        self.root_paned.add(self.top_paned, weight=5)
+
+        # --- Editor side (with gutter)
+        editor_outer = ttk.Frame(self.top_paned)
+        self.top_paned.add(editor_outer, weight=5)
+
+        self.gutter = tk.Text(editor_outer, width=6, padx=6, takefocus=False,
+                              state=tk.DISABLED, wrap="none", font=MONO_FONT, bd=0, highlightthickness=0)
+        self.gutter.pack(side=tk.LEFT, fill=tk.Y)
+
+        editor_frame = ttk.Frame(editor_outer)
+        editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.text = tk.Text(editor_frame, wrap="none", undo=True, font=MONO_FONT, tabs=("1c",), insertwidth=2)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll = ttk.Scrollbar(editor_frame, orient="vertical", command=self._yview_both)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.configure(yscrollcommand=lambda *a: self._yscrollcommand(yscroll, *a))
+
+        # --- Chat holder (not added until toggled)
+        self.chat_holder = ttk.Frame(self.top_paned)
+
+        # --- Bottom consoles notebook
+        self.console_tabs = ttk.Notebook(self.root_paned)
+        self.root_paned.add(self.console_tabs, weight=2)
+
+        # Run Console tab
+        run_frame = ttk.Frame(self.console_tabs)
+        rf_top = ttk.Frame(run_frame)
+        rf_top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.console = tk.Text(rf_top, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.console.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.console.insert("1.0", "")
+        self.console.configure(state=tk.DISABLED)
+        cy = ttk.Scrollbar(rf_top, orient="vertical", command=self.console.yview)
+        cy.pack(side=tk.RIGHT, fill=tk.Y)
+        self.console.configure(yscrollcommand=cy.set)
+
+        rf_bottom = ttk.Frame(run_frame, padding=(0,6))
+        rf_bottom.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(rf_bottom, text="Input:").pack(side=tk.LEFT, padx=(0, 6))
+        self.input_entry = tk.Text(rf_bottom, height=2, font=MONO_FONT, wrap="word")
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(rf_bottom, text="Send (Enter)", command=self.send_input).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(rf_bottom, text="Ctrl-C (SIGINT)", command=self.send_sigint).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(rf_bottom, text="EOF (Ctrl-D)", command=self.send_eof).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(rf_bottom, text="Clear", command=lambda: self.input_entry.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=(0,6))
+        self.console_tabs.add(run_frame, text="Run Console")
+
+        # GPT-5 CLI tab
+        gpt_frame = ttk.Frame(self.console_tabs)
+        gf_top = ttk.Frame(gpt_frame)
+        gf_top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.gpt_output = tk.Text(gf_top, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.gpt_output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        gcy = ttk.Scrollbar(gf_top, orient="vertical", command=self.gpt_output.yview)
+        gcy.pack(side=tk.RIGHT, fill=tk.Y)
+        self.gpt_output.configure(yscrollcommand=gcy.set)
+
+        gf_bottom = ttk.Frame(gpt_frame, padding=(0,6))
+        gf_bottom.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(gf_bottom, text="GPT-5 cmd:").pack(side=tk.LEFT, padx=(0, 6))
+        self.gpt_cmd_var = tk.StringVar(value=self.cfg.get("gpt_cli_cmd", DEFAULTS["gpt_cli_cmd"]))
+        self.gpt_cmd_entry = ttk.Entry(gf_bottom, textvariable=self.gpt_cmd_var, width=50)
+        self.gpt_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Save Cmd", command=self._save_gpt_cmd).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(gf_bottom, text="Prompt:").pack(side=tk.LEFT, padx=(0, 6))
+        self.gpt_input = ttk.Entry(gf_bottom, width=40)
+        self.gpt_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Send (Enter)", command=self.send_gpt).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(gf_bottom, text="Stop", command=self.stop_gpt).pack(side=tk.LEFT, padx=(0, 6))
+        self.console_tabs.add(gpt_frame, text="GPT-5 CLI")
+
+        # GCC tab (NEW)
+        self._build_gcc_tab()
+
+        # Status
+        self.status_outer = tk.Frame(self, bd=0, highlightthickness=0)
+        self.status_outer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status = ttk.Label(self.status_outer, anchor="w", padding=(6, 3))
+        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Search highlight tag
+        self.text.tag_configure("search_hit", background="#ffd54f", foreground="black")
+
+        # Bindings for editor/scroll and inputs
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<KeyRelease>", lambda e: (self._update_title_status(), self._schedule_line_numbers()))
+        self.text.bind("<ButtonRelease-1>", lambda e: (self._update_title_status(), self._schedule_line_numbers()))
+        self.text.bind("<Configure>", lambda e: self._schedule_line_numbers())
+        self.text.bind("<MouseWheel>", lambda e: self._schedule_line_numbers())
+        self.text.bind("<Button-4>", lambda e: self._schedule_line_numbers())  # X11 scroll up
+        self.text.bind("<Button-5>", lambda e: self._schedule_line_numbers())  # X11 scroll down
+
+        self.input_entry.bind("<Return>", self._input_enter)
+        self.input_entry.bind("<Shift-Return>", self._input_newline)
+        self.input_entry.bind("<Control-d>", self._input_ctrl_d)
+        self.gpt_input.bind("<Return>", lambda e: (self.send_gpt(), "break"))
+
+    def _build_gcc_tab(self):
+        gcc_frame = ttk.Frame(self.console_tabs, padding=(6,6))
+        self.console_tabs.add(gcc_frame, text="GCC")
+
+        row = 0
+        # GCC command
+        ttk.Label(gcc_frame, text="gcc cmd:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.gcc_cmd_var = tk.StringVar(value=self.cfg.get("gcc_cmd", DEFAULTS["gcc_cmd"]))
+        self.gcc_cmd_entry = ttk.Entry(gcc_frame, textvariable=self.gcc_cmd_var, width=20)
+        self.gcc_cmd_entry.grid(row=row, column=1, sticky="we", padx=4, pady=4)
+        ttk.Button(gcc_frame, text="Save", command=self._save_gcc_cmd).grid(row=row, column=2, padx=4, pady=4)
+
+        # Source selection
+        row += 1
+        self.use_current_c_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="Use current buffer (.c)", variable=self.use_current_c_var)\
+            .grid(row=row, column=0, sticky="w", padx=4, pady=4, columnspan=2)
+        ttk.Button(gcc_frame, text="Choose .c file…", command=self._choose_c_file)\
+            .grid(row=row, column=2, padx=4, pady=4)
+        self.c_source_path = tk.StringVar(value="")
+
+        # Build dir
+        row += 1
+        ttk.Label(gcc_frame, text="Build dir:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.build_dir_var = tk.StringVar(value=str((Path.cwd() / "build").resolve()))
+        self.build_dir_entry = ttk.Entry(gcc_frame, textvariable=self.build_dir_var, width=36)
+        self.build_dir_entry.grid(row=row, column=1, sticky="we", padx=4, pady=4)
+        ttk.Button(gcc_frame, text="Browse…", command=self._choose_build_dir)\
+            .grid(row=row, column=2, padx=4, pady=4)
+
+        # Output base name
+        row += 1
+        ttk.Label(gcc_frame, text="Output base name:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.output_base_var = tk.StringVar(value="a.out")
+        ttk.Entry(gcc_frame, textvariable=self.output_base_var, width=24)\
+            .grid(row=row, column=1, sticky="we", padx=4, pady=4)
+
+        # Flags row
+        row += 1
+        ttk.Label(gcc_frame, text="Standard:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.std_var = tk.StringVar(value="c11")
+        std_combo = ttk.Combobox(gcc_frame, textvariable=self.std_var, values=["c99", "c11", "c17", "gnu11", "gnu17"], width=8, state="readonly")
+        std_combo.grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(gcc_frame, text="Optimization:").grid(row=row, column=2, sticky="e", padx=4, pady=4)
+        self.opt_var = tk.StringVar(value="-O0")
+        opt_combo = ttk.Combobox(gcc_frame, textvariable=self.opt_var, values=["-O0", "-O1", "-O2", "-O3", "-Ofast"], width=8, state="readonly")
+        opt_combo.grid(row=row, column=3, sticky="w", padx=4, pady=4)
+
+        # Warnings & debug
+        row += 1
+        self.wall_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="-Wall -Wextra", variable=self.wall_var).grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.debug_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gcc_frame, text="-g (debug)", variable=self.debug_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(gcc_frame, text="Extra flags:").grid(row=row, column=2, sticky="e", padx=4, pady=4)
+        self.extra_flags_var = tk.StringVar(value="")
+        ttk.Entry(gcc_frame, textvariable=self.extra_flags_var, width=30).grid(row=row, column=3, sticky="we", padx=4, pady=4)
+
+        # Outputs selection
+        row += 1
+        ttk.Label(gcc_frame, text="Outputs:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        self.out_exec_var = tk.BooleanVar(value=True)
+        self.out_obj_var = tk.BooleanVar(value=False)
+        self.out_asm_var = tk.BooleanVar(value=False)
+        self.out_pre_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(gcc_frame, text="Executable", variable=self.out_exec_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(gcc_frame, text="Object (.o)", variable=self.out_obj_var).grid(row=row, column=2, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(gcc_frame, text="Assembly (.s)", variable=self.out_asm_var).grid(row=row, column=3, sticky="w", padx=4, pady=4)
+        row += 1
+        ttk.Checkbutton(gcc_frame, text="Preprocessed (.i)", variable=self.out_pre_var).grid(row=row, column=1, sticky="w", padx=4, pady=4)
+
+        # Build buttons
+        row += 1
+        ttk.Button(gcc_frame, text="Compile", command=self._gcc_compile).grid(row=row, column=0, padx=4, pady=8, sticky="w")
+        ttk.Button(gcc_frame, text="Open Build Dir", command=self._open_build_dir).grid(row=row, column=1, padx=4, pady=8, sticky="w")
+
+        # Output log
+        row += 1
+        self.gcc_log = tk.Text(gcc_frame, height=12, wrap="word", state=tk.NORMAL, font=MONO_FONT)
+        self.gcc_log.grid(row=row, column=0, columnspan=4, sticky="nsew", padx=2, pady=2)
+        gscroll = ttk.Scrollbar(gcc_frame, orient="vertical", command=self.gcc_log.yview)
+        gscroll.grid(row=row, column=4, sticky="ns")
+        self.gcc_log.configure(yscrollcommand=gscroll.set)
+        gcc_frame.grid_columnconfigure(1, weight=1)
+        gcc_frame.grid_columnconfigure(3, weight=1)
+        gcc_frame.grid_rowconfigure(row, weight=1)
+
+    # Chat panel (toggle + send to run console)
+    def toggle_chat_panel(self):
+        if self.chat_visible:
+            self.top_paned.forget(self.chat_holder)
+            for w in self.chat_holder.winfo_children():
+                w.destroy()
+            self.chat_visible = False
+        else:
+            self.chat_holder = ttk.Frame(self.top_paned)
+            self.top_paned.add(self.chat_holder, weight=2)
+            chat_toolbar = ttk.Frame(self.chat_holder)
+            chat_toolbar.pack(side=tk.TOP, fill=tk.X)
+            ttk.Label(chat_toolbar, text="Chat").pack(side=tk.LEFT, padx=(0,6))
+            ttk.Button(chat_toolbar, text="Send to Run (Ctrl+Enter)", command=self.chat_send_to_run).pack(side=tk.LEFT)
+            self.chat_box = tk.Text(self.chat_holder, width=36, wrap="word", font=MONO_FONT, insertwidth=2)
+            self.chat_box.pack(fill=tk.BOTH, expand=True)
+            self.chat_box.bind("<Control-Return>", lambda e: (self.chat_send_to_run(), "break"))
+            self.chat_visible = True
+            self._apply_theme()
+
+    def chat_send_to_run(self):
+        if not hasattr(self, "chat_box"):
+            return
+        try:
+            data = self.chat_box.get("sel.first", "sel.last")
+        except tk.TclError:
+            data = self.chat_box.get("insert linestart", "insert lineend")
+        data = data.strip()
+        if not data:
+            self.status.config(text="[Chat → Run] Nothing to send")
+            return
+        self._console_write(f"> {data}\n")
+        with self.proc_lock:
+            if self.proc and self.proc.stdin:
+                try:
+                    self.proc.stdin.write(data + "\n")
+                    self.proc.stdin.flush()
+                except Exception as e:
+                    self._console_write(f"[input error] {e}\n")
+            else:
+                self._console_write("[no process running]\n")
+
+    # ---------- Bind keys ----------
+    def _bind_keys(self):
+        self.bind_all("<Control-s>", lambda e: (self.save_file(), "break"))
+        self.bind_all("<Control-S>", lambda e: (self.save_file(), "break"))
+        self.bind_all("<Control-o>", lambda e: (self.open_file(), "break"))
+        self.bind_all("<Control-n>", lambda e: (self.new_file(), "break"))
+
+        self.bind_all("<Control-a>", self._select_all)
+        self.bind_all("<Control-A>", self._select_all)
+        self.bind_all("<Control-f>", lambda e: (self._find_popup(), "break"))
+        self.bind_all("<Control-F>", lambda e: (self._find_popup(), "break"))
+        self.bind_all("<Control-k>", lambda e: (self._cut_current_line(), "break"))
+        self.bind_all("<Control-K>", self._cut_current_line)
+        self.bind_all("<Control-c>", lambda e: (self.text.event_generate("<<Copy>>"), "break"))
+        self.bind_all("<Control-C>", lambda e: (self.text.event_generate("<<Copy>>"), "break"))
+        self.bind_all("<Control-v>", lambda e: (self.text.event_generate("<<Paste>>"), "break"))
+        self.bind_all("<Control-V>", lambda e: (self.text.event_generate("<<Paste>>"), "break"))
+
+        self.bind_all("<Control-z>", lambda e: (self.text.event_generate("<<Undo>>"), "break"))
+        self.bind_all("<Control-y>", lambda e: (self.text.event_generate("<<Redo>>"), "break"))
+        self.bind_all("<Control-Shift-C>", lambda e: (self.copy_all(), "break"))
+        self.bind_all("<F5>", lambda e: (self.run_current(), "break"))
+        self.bind_all("<Escape>", lambda e: (self.stop_run(), "break"))
+        self.bind_all("<Control-Shift-D>", lambda e: (self.toggle_dark_mode(), "break"))
+
+    # ---------- Theme ----------
+    def toggle_dark_mode(self):
+        self.cfg["dark_mode"] = not self.cfg.get("dark_mode", True)
+        save_cfg(self.cfg)
+        self.theme = DARK if self.cfg["dark_mode"] else LIGHT
+        self._apply_theme()
+        self._schedule_line_numbers()
+
+    def _apply_theme(self):
+        t = self.theme
+        self.configure(bg=t["bg"])
+        self.toolbar_outer.configure(bg=t["toolbar_bg"])
+        self.status_outer.configure(bg=t["status_bg"])
+        self.text.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"],
+                            selectbackground=t["sel_bg"], selectforeground=t["sel_fg"])
+        self.gutter.configure(state=tk.NORMAL, bg=t["gutter_bg"], fg=t["gutter_fg"])
+        self.gutter.delete("1.0", tk.END)
+        self.gutter.configure(state=tk.DISABLED)
+        self.console.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        self.input_entry.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"], bd=1, highlightthickness=1)
+        self.gpt_output.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        if hasattr(self, "gcc_log"):
+            self.gcc_log.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        if self.chat_visible and hasattr(self, "chat_box"):
+            self.chat_box.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+        # dynamic consoles theme
+        for c in self.consoles:
+            c["text"].configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+            c["input"].configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+
+        self.status.configure(background=t["status_bg"], foreground=t["status_fg"])
+        style = ttk.Style()
+        for base in ("clam", "alt", "default"):
+            if base in style.theme_names():
+                style.theme_use(base); break
+        style.configure("TFrame", background=t["bg"])
+        style.configure("TLabel", background=t["bg"], foreground=t["fg"])
+        style.configure("TButton", padding=6)
+        style.configure("TEntry", fieldbackground=t["bg"], foreground=t["fg"])
+        style.configure("Tool.TFrame", background=t["toolbar_bg"])
+        style.configure("TPanedwindow", sashrelief="flat")
+        self.toolbar.configure(style="Tool.TFrame")
+
+    # ---------- File ops ----------
+    def new_file(self):
+        if not self._maybe_save_changes(): return
+        self.filename = None
+        self._draft_path = None
+        self.text.delete("1.0", tk.END)
+        self._modified = False
+        self._update_title_status()
+        self._auto_fill_run_cmd()
+        self._schedule_line_numbers()
+
+    def open_file(self):
+        if not self._maybe_save_changes(): return
+        path = filedialog.askopenfilename(title="Open file")
+        if not path: return
+        try:
+            data = Path(path).read_text(encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Open failed", f"{e}")
+            return
+        self.filename = Path(path)
+        self._draft_path = None
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", data)
+        self._modified = False
+        self._update_title_status()
+        self._auto_fill_run_cmd()
+        self._schedule_line_numbers()
+
+    def save_file(self):
+        if self.filename is None:
+            return self.save_file_as()
+        try:
+            data = self.text.get("1.0", tk.END)
+            self.filename.write_text(data.rstrip("\n") + "\n", encoding="utf-8")
+            self._modified = False
+            self._update_title_status()
+            self.status.config(text=f"Saved to {self.filename}")
+            return True
+        except Exception as e:
+            messagebox.showerror("Save failed", f"{e}")
+            return False
+
+    def save_file_as(self):
+        path = filedialog.asksaveasfilename(title="Save As", defaultextension="",
+                                            initialfile=(self.filename.name if self.filename else "untitled.txt"))
+        if not path: return False
+        self.filename = Path(path)
+        self._draft_path = None
+        self._auto_fill_run_cmd()
+        return self.save_file()
+
+    # ---------- Restart ----------
+    def restart_app(self):
+        """Restart the IDE by re-executing the Python process."""
+        if not self._maybe_save_changes():
+            return
+        try:
+            self.stop_run()
+            self.stop_gpt()
+            self._stop_all_extra_consoles()
+        except Exception:
+            pass
+        python = sys.executable
+        args = [python] + sys.argv
+        self.destroy()
+        os.execv(python, args)
+
+    # ---------- Edit ops ----------
+    def _select_all(self, event=None):
+        self.text.tag_add(tk.SEL, "1.0", tk.END)
+        self.text.mark_set(tk.INSERT, "1.0")
+        self.text.see(tk.INSERT)
+        return "break"
+
+    def _cut_current_line(self, event=None):
+        index = self.text.index(tk.INSERT)
+        line, _ = map(int, index.split("."))
+        start, end = f"{line}.0", f"{line + 1}.0"
+        content = self.text.get(start, end)
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.text.delete(start, end)
+        self._modified = True
+        self._update_title_status()
+        self._schedule_line_numbers()
+        return "break"
+
+    def copy_all(self):
+        data = self.text.get("1.0", tk.END).rstrip()
+        self.clipboard_clear()
+        self.clipboard_append(data)
+        self.status.config(text="[All code copied]")
+        self.after(1500, self._update_title_status)
+
+    # ---------- Find ----------
+    def _find_popup(self):
+        popup = tk.Toplevel(self); popup.title("Find"); popup.transient(self); popup.grab_set()
+        frm = ttk.Frame(popup, padding=8); frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Find:").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        var = tk.StringVar(); ent = ttk.Entry(frm, textvariable=var, width=40)
+        ent.grid(row=0, column=1, padx=6, pady=6)
+        def do_find():
+            self.text.tag_remove("search_hit", "1.0", tk.END)
+            needle = var.get()
+            if not needle: return
+            start = "1.0"
+            while True:
+                pos = self.text.search(needle, start, stopindex=tk.END, nocase=1)
+                if not pos: break
+                self.text.tag_add("search_hit", pos, f"{pos}+{len(needle)}c")
+                start = f"{pos}+1c"
+        ttk.Button(frm, text="Find All", command=do_find).grid(row=0, column=2, padx=6, pady=6)
+        ent.focus_set()
+
+    # ---------- Run console ----------
+    def run_current(self):
+        if self.proc is not None:
+            messagebox.showwarning("Running", "A process is already running. Stop it first.")
+            return
+        if self.filename is None:
+            choice = messagebox.askyesnocancel("Save file?",
+                "This buffer has never been saved.\nYes = Save As and run\nNo = Run a temp copy\nCancel = Abort")
+            if choice is None: return
+            if choice:
+                if not self.save_file_as(): return
+            else:
+                tmp = Path(AUTOSAVE_DIR / f"temp-{int(time.time())}.txt")
+                tmp.write_text(self.text.get("1.0", tk.END), encoding="utf-8")
+                self._start_process_for_path(tmp, temp_mode=True); return
+        else:
+            if self._modified and not self.save_file(): return
+        self._start_process_for_path(self.filename, temp_mode=False)
+
+    def _start_process_for_path(self, path: Path, temp_mode: bool):
+        cmd = self._compute_run_cmd_for(path)
+        override = self.run_cmd_var.get().strip()
+        if override:
+            cmd = override.replace("{file}", str(path))
+        self._console_clear()
+        self._console_write(f"$ {cmd}\n\n")
+        try:
+            with self.proc_lock:
+                self.proc = subprocess.Popen(
+                    cmd, shell=True, cwd=str(path.parent),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE, text=True, bufsize=1
+                )
+            self.btn_run.configure(state=tk.DISABLED)
+            self.btn_stop.configure(state=tk.NORMAL)
+            self.input_entry.focus_set()
+            threading.Thread(target=self._pump_output, daemon=True).start()
+        except Exception as e:
+            self._console_write(f"[error] {e}\n")
+
+        if temp_mode:
+            def cleanup_when_done():
+                if self.proc is None:
+                    try: path.unlink(missing_ok=True)
+                    except Exception: pass
+                else:
+                    self.after(500, cleanup_when_done)
+            self.after(500, cleanup_when_done)
+
+    def stop_run(self):
+        with self.proc_lock:
+            if self.proc is None: return
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+    def _pump_output(self):
+        p = self.proc; assert p is not None
+        try:
+            for line in p.stdout:
+                self._console_write(line)
+        except Exception as e:
+            self._console_write(f"\n[stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self._console_write(f"\n[process exited with code {rc}]\n")
+            with self.proc_lock:
+                self.proc = None
+            self.after(0, lambda: (self.btn_run.configure(state=tk.NORMAL),
+                                   self.btn_stop.configure(state=tk.DISABLED)))
+
+    # input helpers (Run Console)
+    def _input_enter(self, event):
+        self.send_input(); return "break"
+    def _input_newline(self, event):
+        self.input_entry.insert(tk.INSERT, "\n"); return "break"
+    def _input_ctrl_d(self, event):
+        self.send_eof(); return "break"
+
+    def send_input(self):
+        text = self.input_entry.get("1.0", tk.END)
+        if not text.strip() and text != "\n":
+            return
+        self._console_write(f"> {text}")
+        with self.proc_lock:
+            if self.proc and self.proc.stdin:
+                try:
+                    self.proc.stdin.write(text)
+                    if not text.endswith("\n"): self.proc.stdin.write("\n")
+                    self.proc.stdin.flush()
+                except Exception as e:
+                    self._console_write(f"\n[input error] {e}\n")
+            else:
+                self._console_write("[no process running]\n")
+        self.input_entry.delete("1.0", tk.END)
+
+    def send_sigint(self):
+        with self.proc_lock:
+            if self.proc is None: return
+            try:
+                os.kill(self.proc.pid, signal.SIGINT)
+                self._console_write("\n[sent SIGINT]\n")
+            except Exception as e:
+                self._console_write(f"\n[sigint error] {e}\n")
+
+    def send_eof(self):
+        with self.proc_lock:
+            if self.proc is None or self.proc.stdin is None: return
+            try:
+                self.proc.stdin.close()
+                self._console_write("\n[stdin closed — sent EOF]\n")
+            except Exception as e:
+                self._console_write(f"\n[eof error] {e}\n")
+
+    def _console_clear(self):
+        self.console.configure(state=tk.NORMAL)
+        self.console.delete("1.0", tk.END)
+        self.console.configure(state=tk.DISABLED)
+
+    def _console_write(self, text: str):
+        self.console.configure(state=tk.NORMAL)
+        self.console.insert(tk.END, text)
+        self.console.see(tk.END)
+        self.console.configure(state=tk.DISABLED)
+
+    # ---------- Extra Console Tabs ----------
+    def new_console_tab(self):
+        """Create a new interactive shell console tab."""
+        self.console_count += 1
+        tab_name = f"Console {self.console_count}"
+        frame = ttk.Frame(self.console_tabs)
+
+        # Output view
+        top = ttk.Frame(frame)
+        top.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        text = tk.Text(top, height=12, wrap="word", state=tk.DISABLED, font=MONO_FONT)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(top, orient="vertical", command=text.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=scroll.set)
+
+        # Input row
+        bottom = ttk.Frame(frame, padding=(0,6))
+        bottom.pack(side=tk.TOP, fill=tk.X)
+        inp = tk.Text(bottom, height=2, font=MONO_FONT, wrap="word")
+        inp.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        send_btn = ttk.Button(bottom, text="Send (Enter)")
+        sig_btn = ttk.Button(bottom, text="Ctrl-C")
+        eof_btn = ttk.Button(bottom, text="EOF")
+        clr_btn = ttk.Button(bottom, text="Clear")
+        send_btn.pack(side=tk.LEFT, padx=(0,6))
+        sig_btn.pack(side=tk.LEFT, padx=(0,6))
+        eof_btn.pack(side=tk.LEFT, padx=(0,6))
+        clr_btn.pack(side=tk.LEFT, padx=(0,6))
+
+        # Launch shell
+        try:
+            proc = subprocess.Popen(
+                "bash",
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+        except Exception as e:
+            text.configure(state=tk.NORMAL); text.insert(tk.END, f"[Error launching shell: {e}]\n")
+            text.configure(state=tk.DISABLED)
+            return
+
+        lock = threading.Lock()
+        console = {"frame": frame, "text": text, "input": inp, "proc": proc, "lock": lock}
+        self.consoles.append(console)
+
+        # Wire buttons/bindings
+        def send():
+            data = inp.get("1.0", tk.END).rstrip()
+            inp.delete("1.0", tk.END)
+            if not data: return
+            self._console_write_to(console, f"> {data}\n")
+            with lock:
+                try:
+                    proc.stdin.write(data + "\n")
+                    proc.stdin.flush()
+                except Exception as ex:
+                    self._console_write_to(console, f"[input error] {ex}\n")
+        def sig():
+            try:
+                os.kill(proc.pid, signal.SIGINT)
+                self._console_write_to(console, "\n[sent SIGINT]\n")
+            except Exception as ex:
+                self._console_write_to(console, f"\n[sigint error] {ex}\n")
+        def eof():
+            try:
+                proc.stdin.close()
+                self._console_write_to(console, "\n[stdin closed — sent EOF]\n")
+            except Exception as ex:
+                self._console_write_to(console, f"\n[eof error] {ex}\n")
+        def clr():
+            text.configure(state=tk.NORMAL); text.delete("1.0", tk.END); text.configure(state=tk.DISABLED)
+
+        send_btn.configure(command=send)
+        sig_btn.configure(command=sig)
+        eof_btn.configure(command=eof)
+        clr_btn.configure(command=clr)
+        inp.bind("<Return>", lambda e: (send(), "break"))
+        inp.bind("<Shift-Return>", lambda e: (inp.insert(tk.INSERT, "\n"), "break"))
+        inp.bind("<Control-d>", lambda e: (eof(), "break"))
+
+        # Theme for this console
+        t = self.theme
+        text.configure(bg=t["console_bg"], fg=t["console_fg"], insertbackground=t["cursor"])
+        inp.configure(bg=t["bg"], fg=t["fg"], insertbackground=t["cursor"])
+
+        self.console_tabs.add(frame, text=tab_name)
+        self.console_tabs.select(frame)
+
+        threading.Thread(target=self._pump_console_output, args=(console,), daemon=True).start()
+
+    def _pump_console_output(self, console):
+        p = console["proc"]
+        try:
+            for line in p.stdout:
+                self._console_write_to(console, line)
+        except Exception as e:
+            self._console_write_to(console, f"\n[stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self._console_write_to(console, f"\n[process exited with code {rc}]\n")
+
+    def _console_write_to(self, console, text: str):
+        t = console["text"]
+        t.configure(state=tk.NORMAL)
+        t.insert(tk.END, text)
+        t.see(tk.END)
+        t.configure(state=tk.DISABLED)
+
+    def _stop_all_extra_consoles(self):
+        for c in self.consoles:
+            try:
+                if c["proc"]:
+                    c["proc"].terminate()
+            except Exception:
+                pass
+
+    # ---------- GPT-5 CLI tab ----------
+    def _save_gpt_cmd(self):
+        self.cfg["gpt_cli_cmd"] = self.gpt_cmd_var.get().strip() or DEFAULTS["gpt_cli_cmd"]
+        save_cfg(self.cfg)
+        self.gpt_output.insert(tk.END, f"[Saved GPT cmd] {self.cfg['gpt_cli_cmd']}\n")
+        self.gpt_output.see(tk.END)
+
+    def send_gpt(self):
+        prompt = self.gpt_input.get().strip()
+        if not prompt: return
+        self.gpt_input.delete(0, tk.END)
+        self.gpt_output.insert(tk.END, f"\n> {prompt}\n")
+        self.gpt_output.see(tk.END)
+
+        cmd = self.gpt_cmd_var.get().strip() or DEFAULTS["gpt_cli_cmd"]
+        try:
+            with self.gpt_lock:
+                self.gpt_proc = subprocess.Popen(
+                    cmd, shell=True, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                self.gpt_proc.stdin.write(prompt + "\n")
+                self.gpt_proc.stdin.close()
+            threading.Thread(target=self._pump_gpt_output, daemon=True).start()
+        except Exception as e:
+            self.gpt_output.insert(tk.END, f"[Error launching GPT CLI: {e}]\n")
+
+    def _pump_gpt_output(self):
+        p = self.gpt_proc
+        if p is None: return
+        try:
+            for line in p.stdout:
+                self.gpt_output.insert(tk.END, line)
+                self.gpt_output.see(tk.END)
+        except Exception as e:
+            self.gpt_output.insert(tk.END, f"\n[gpt stream error] {e}\n")
+        finally:
+            rc = p.wait()
+            self.gpt_output.insert(tk.END, f"\n[GPT process exited with code {rc}]\n")
+            with self.gpt_lock:
+                self.gpt_proc = None
+
+    def stop_gpt(self):
+        with self.gpt_lock:
+            if not self.gpt_proc: return
+            try:
+                self.gpt_proc.terminate()
+                self.gpt_output.insert(tk.END, "\n[Stopped GPT process]\n")
+            except Exception as e:
+                self.gpt_output.insert(tk.END, f"\n[gpt stop error] {e}\n")
+            self.gpt_proc = None
+
+    # ---------- GCC actions ----------
+    def _save_gcc_cmd(self):
+        self.cfg["gcc_cmd"] = self.gcc_cmd_var.get().strip() or DEFAULTS["gcc_cmd"]
+        save_cfg(self.cfg)
+        self._gcc_log_write(f"[Saved gcc cmd] {self.cfg['gcc_cmd']}\n")
+
+    def _choose_c_file(self):
+        path = filedialog.askopenfilename(title="Choose C source", filetypes=[("C source", "*.c"), ("All files", "*.*")])
+        if path:
+            self.c_source_path.set(path)
+            self.use_current_c_var.set(False)
+
+    def _choose_build_dir(self):
+        path = filedialog.askdirectory(title="Choose build directory")
+        if path:
+            self.build_dir_var.set(path)
+
+    def _open_build_dir(self):
+        d = self.build_dir_var.get().strip()
+        if not d: return
+        self._gcc_log_write(f"[Build dir] {d}\n")
+        # Leave to user to open in their file manager/terminal
+
+    def _gcc_log_write(self, text: str):
+        self.gcc_log.insert(tk.END, text)
+        self.gcc_log.see(tk.END)
+
+    def _gcc_compile(self):
+        gcc = self.gcc_cmd_var.get().strip() or "gcc"
+        # Resolve source
+        if self.use_current_c_var.get():
+            if not self.filename or self.filename.suffix.lower() != ".c":
+                messagebox.showerror("No C source", "Current buffer is not a saved .c file. Save as *.c or uncheck 'Use current buffer'.")
+                return
+            if self._modified and not self.save_file():
+                return
+            src = str(self.filename)
+            base_default = self.filename.stem
+        else:
+            src = self.c_source_path.get().strip()
+            if not src or not Path(src).exists():
+                messagebox.showerror("No C source", "Choose a valid .c file.")
+                return
+            base_default = Path(src).stem
+
+        build_dir = Path(self.build_dir_var.get().strip()).expanduser().resolve()
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        base = self.output_base_var.get().strip() or base_default
+        # Flags
+        flags = []
+        if self.std_var.get(): flags += [f"-std={self.std_var.get()}"]
+        if self.wall_var.get(): flags += ["-Wall", "-Wextra"]
+        if self.debug_var.get(): flags += ["-g"]
+        if self.opt_var.get(): flags += [self.opt_var.get()]
+        extra = self.extra_flags_var.get().strip()
+        if extra:
+            # simple split (user can put quoted flags if needed)
+            flags += shlex.split(extra)
+
+        # Outputs
+        wants = []
+        if self.out_exec_var.get(): wants.append(("exec", str(build_dir / base)))
+        if self.out_obj_var.get():  wants.append(("obj",  str(build_dir / f"{base}.o")))
+        if self.out_asm_var.get():  wants.append(("asm",  str(build_dir / f"{base}.s")))
+        if self.out_pre_var.get():  wants.append(("pre",  str(build_dir / f"{base}.i")))
+        if not wants:
+            messagebox.showinfo("Nothing to do", "Select at least one output format.")
+            return
+
+        self.gcc_log.delete("1.0", tk.END)
+        self._gcc_log_write(f"[gcc] {gcc}\n[src] {src}\n[build] {build_dir}\n[flags] {' '.join(flags) if flags else '(none)'}\n\n")
+
+        def run_cmd(cmd_list):
+            self._gcc_log_write("$ " + " ".join(shlex.quote(x) for x in cmd_list) + "\n")
+            try:
+                p = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=build_dir)
+                for line in p.stdout:
+                    self._gcc_log_write(line)
+                rc = p.wait()
+                self._gcc_log_write(f"[exit {rc}]\n\n")
+                return rc == 0
+            except Exception as e:
+                self._gcc_log_write(f"[spawn error] {e}\n\n")
+                return False
+
+        ok_all = True
+        for kind, outpath in wants:
+            if kind == "exec":
+                cmd = [gcc, src, "-o", outpath] + flags
+            elif kind == "obj":
+                cmd = [gcc, "-c", src, "-o", outpath] + flags
+            elif kind == "asm":
+                cmd = [gcc, "-S", src, "-o", outpath] + flags
+            elif kind == "pre":
+                # -E sends to stdout by default; -o writes to file, supported by gcc
+                cmd = [gcc, "-E", src, "-o", outpath] + flags
+            else:
+                continue
+            ok = run_cmd(cmd)
+            if ok:
+                self._gcc_log_write(f"[ok] wrote {outpath}\n\n")
+            ok_all = ok_all and ok
+
+        if ok_all:
+            self._gcc_log_write("[build] SUCCESS ✅\n")
+        else:
+            self._gcc_log_write("[build] DONE with errors ❌\n")
+
+    # ---------- Line numbers ----------
+    def _yview_both(self, *args):
+        self.text.yview(*args)
+        self.gutter.yview(*args)
+        self._schedule_line_numbers()
+
+    def _yscrollcommand(self, sb, first, last):
+        sb.set(first, last)
+        self.gutter.yview_moveto(first)
+        self._schedule_line_numbers()
+
+    def _schedule_line_numbers(self):
+        if self._ln_sched: return
+        self._ln_sched = True
+        self.after_idle(self._update_line_numbers)
+
+    def _update_line_numbers(self):
+        self._ln_sched = False
+        try:
+            first_index = self.text.index("@0,0")
+            last_index = self.text.index(f"@0,{self.text.winfo_height()}")
+        except Exception:
+            return
+        first_line = int(first_index.split(".")[0])
+        last_line = int(last_index.split(".")[0]) + 1
+        total_lines = int(self.text.index("end-1c").split(".")[0])
+        width = max(3, len(str(total_lines)) + 1)
+
+        self.gutter.configure(state=tk.NORMAL, width=width)
+        self.gutter.delete("1.0", tk.END)
+        blanks = "\n" * (first_line - 1)
+        self.gutter.insert("1.0", blanks)
+        for n in range(first_line, last_line + 1):
+            self.gutter.insert(f"{n}.0", f"{n}".rjust(width) + "\n")
+        self.gutter.configure(state=tk.DISABLED)
+        first, _ = self.text.yview()
+        self.gutter.yview_moveto(first)
+
+    # ---------- Autosave ----------
+    def _toggle_autosave(self):
+        self.cfg["autosave"] = bool(self.autosave_var.get())
+        save_cfg(self.cfg)
+        if self.cfg["autosave"]:
+            self._schedule_autosave()
+            self.status.config(text="[Auto-Save ON]")
+        else:
+            if self._autosave_job:
+                self.after_cancel(self._autosave_job)
+                self._autosave_job = None
+            self.status.config(text="[Auto-Save OFF]")
+
+    def _apply_autosave_interval(self):
+        try:
+            val = max(3, min(3600, int(self.autosave_interval_var.get())))
+            self.cfg["autosave_interval_sec"] = val
+            save_cfg(self.cfg)
+            if self.cfg.get("autosave"):
+                if self._autosave_job:
+                    self.after_cancel(self._autosave_job)
+                    self._autosave_job = None
+                self._schedule_autosave()
+        except Exception:
+            pass
+
+    def _schedule_autosave(self):
+        interval = int(self.cfg.get("autosave_interval_sec", 10)) * 1000
+        self._autosave_job = self.after(interval, self._do_autosave)
+
+    def _do_autosave(self):
+        try:
+            data = self.text.get("1.0", tk.END)
+            if self.filename:
+                path = self.filename
+            else:
+                if not self._draft_path:
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    self._draft_path = AUTOSAVE_DIR / f"draft-{ts}.txt"
+                path = self._draft_path
+            path.write_text(data.rstrip("\n") + "\n", encoding="utf-8")
+            self.status.config(text=f"[Auto-saved] {path}")
+        except Exception as e:
+            self.status.config(text=f"[Auto-save failed] {e}")
+        finally:
+            self._schedule_autosave()
+
+    # ---------- Helpers ----------
+    def _update_title_status(self):
+        name = (self.filename.name if self.filename else (self._draft_path.name if self._draft_path else "untitled"))
+        mod = " *" if self._modified else ""
+        self.title(f"{APP_TITLE} — {name}{mod}")
+        idx = self.text.index(tk.INSERT)
+        line, col = idx.split(".")
+        self.status.config(text=f"{name}{mod}   |   Line {line}, Col {int(col)+1}")
+
+    def _on_modified(self, event=None):
+        if self.text.edit_modified():
+            self._modified = True
+            self.text.edit_modified(False)
+        self._update_title_status()
+        self._schedule_line_numbers()
+
+    def _on_close(self):
+        if not self._maybe_save_changes(): return
+        self.stop_run()
+        self.stop_gpt()
+        self._stop_all_extra_consoles()
+        if self._autosave_job:
+            try: self.after_cancel(self._autosave_job)
+            except Exception: pass
+        self.destroy()
+
+    def _maybe_save_changes(self) -> bool:
+        if not self._modified:
+            return True
+        resp = messagebox.askyesnocancel("Unsaved changes", "Save changes before closing?")
+        if resp is None: return False
+        if resp: return bool(self.save_file())
+        return True
+
+    def _auto_fill_run_cmd(self):
+        if self.filename is None:
+            self.run_cmd_var.set("")
+        else:
+            self.run_cmd_var.set(self._compute_run_cmd_for(self.filename))
+
+    def _compute_run_cmd_for(self, path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext == ".py": return f'python3 "{path}"'
+        if ext == ".sh": return f'bash "{path}"'
+        if os.access(path, os.X_OK): return f'"{path}"'
+        return f'sh "{path}"'
+
+
+if __name__ == "__main__":
+    try:
+        style = ttk.Style()
+        for theme in ("clam", "alt", "default"):
+            if theme in style.theme_names():
+                style.theme_use(theme); break
+    except Exception:
+        pass
+    app = MiniNano()
+    app.mainloop()
+
